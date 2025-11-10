@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    container_name: school-backend
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"  # expose only on server (Nginx reverse proxies)
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - mongo
+    networks:
+      - school-network
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7.0
+    container_name: school-mongo
+    command: ["--bind_ip_all"]
+    volumes:
+      - ./mongo-data:/data/db  # persist data across deploys
+    networks:
+      - school-network
+    restart: unless-stopped
+
+networks:
+  school-network:
+    driver: bridge
+
+
