@@ -55,7 +55,17 @@ jobs:
             set -e
             cd ${{ secrets.VPS_DEPLOY_BACKEND_PATH }}
             docker load < backend-image.tar.gz
-            docker compose up -d --no-deps web
+            
+            # Use docker-compose (with hyphen) if available, otherwise docker compose
+            if command -v docker-compose &> /dev/null; then
+              docker-compose up -d --no-deps web
+            elif docker compose version &> /dev/null 2>&1; then
+              docker compose up -d --no-deps web
+            else
+              echo "❌ Neither docker-compose nor docker compose found"
+              exit 1
+            fi
+            
             # Health check
             sleep 5
             curl -fsS http://localhost:8000/api/v1/events/public >/dev/null || (echo "Health check failed" && exit 1)
