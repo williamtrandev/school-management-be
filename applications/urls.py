@@ -1,6 +1,10 @@
 from django.urls import path, include
+from applications.common.healthcheck import healthcheck
 
 urlpatterns = [
+    # Health check endpoint (public, no auth required)
+    path('health', healthcheck, name='healthcheck'),
+    
     # User Management (Mongo auth)
     path('', include('applications.user_management.urls')),
 

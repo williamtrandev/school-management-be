@@ -203,9 +203,16 @@ jobs:
             echo "🏥 Running health check..."
             sleep 5
             for i in {1..10}; do
-              if curl -fsS http://localhost:8000/api/v1/events/public >/dev/null 2>&1; then
-                echo "✅ Health check passed"
-                exit 0
+              if curl -fsS http://localhost:8000/api/v1/health >/dev/null 2>&1; then
+                # Verify health check response
+                HEALTH_RESPONSE=$(curl -s http://localhost:8000/api/v1/health)
+                if echo "$HEALTH_RESPONSE" | grep -q '"status":"ok"'; then
+                  echo "✅ Health check passed"
+                  echo "Health status: $HEALTH_RESPONSE"
+                  exit 0
+                else
+                  echo "⚠️ Health check returned degraded status: $HEALTH_RESPONSE"
+                fi
               fi
               echo "⏳ Waiting for backend to be ready... ($i/10)"
               sleep 2
@@ -214,5 +221,7 @@ jobs:
             echo "❌ Health check failed after 20 seconds"
             echo "Backend logs:"
             docker logs school-backend --tail 50
+            echo "Health check response:"
+            curl -s http://localhost:8000/api/v1/health || echo "Cannot reach health endpoint"
             exit 1
 

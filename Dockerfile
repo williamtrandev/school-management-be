@@ -26,9 +26,9 @@ ENV DJANGO_SETTINGS_MODULE=school_management.settings \
     GUNICORN_WORKERS=3 \
     GUNICORN_TIMEOUT=60
 
-# Healthcheck (optional; relies on an accessible endpoint)
-# HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-#   CMD curl -fsS http://localhost:8000/api/v1/events/public || exit 1
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:8000/api/v1/health || exit 1
 
 # Entrypoint runs migrations if needed (SQLite only used for Django internals)
 CMD gunicorn school_management.wsgi:application \
