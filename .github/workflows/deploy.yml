@@ -23,35 +23,28 @@ jobs:
       - name: Upload backend image artifact
         uses: actions/upload-artifact@v4
         with:
-          name: backend-image
-          path: backend-image.tar.gz
+          name: deployment-files
+          path: |
+            backend-image.tar.gz
+            docker-compose.yml
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download backend image artifact
+      - name: Download backend files artifact
         uses: actions/download-artifact@v4
         with:
-          name: backend-image
+          name: deployment-files
           path: .
 
-      - name: Copy image to VPS
+      - name: Copy files (docker-compose.yml & image) to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "backend-image.tar.gz"
-          target: "${{ secrets.VPS_DEPLOY_BACKEND_PATH }}/"
-
-      - name: Copy docker-compose.yml to VPS
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          source: "docker-compose.yml"
+          source: "docker-compose.yml,backend-image.tar.gz"
           target: "${{ secrets.VPS_DEPLOY_BACKEND_PATH }}/"
 
       - name: Deploy on VPS
