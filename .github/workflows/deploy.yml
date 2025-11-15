@@ -42,7 +42,7 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "docker-compose.yml"
+          source: "backend-image.tar.gz"
           target: "${{ secrets.VPS_DEPLOY_BACKEND_PATH }}/"
 
       - name: Copy docker-compose.yml to VPS
