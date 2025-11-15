@@ -146,8 +146,46 @@ jobs:
               COMPOSE_CMD="docker-compose"
             fi
             
-            # Start/update services
-            echo "🚀 Starting services..."
+            # Ensure network exists
+            echo "🌐 Ensuring Docker network exists..."
+            docker network create school-network 2>/dev/null || echo "Network already exists"
+            
+            # Start MongoDB first (if not running)
+            echo "🚀 Starting MongoDB..."
+            $COMPOSE_CMD up -d mongo
+            
+            # Wait for MongoDB to be ready
+            echo "⏳ Waiting for MongoDB to be ready..."
+            for i in {1..30}; do
+              # Try multiple ways to check if MongoDB is ready
+              if docker exec school-mongo mongosh --eval "db.adminCommand('ping')" >/dev/null 2>&1 || \
+                 docker exec school-mongo mongo --eval "db.adminCommand('ping')" >/dev/null 2>&1 || \
+                 nc -z localhost 27017 2>/dev/null; then
+                echo "✅ MongoDB is ready"
+                break
+              fi
+              if [ $i -eq 30 ]; then
+                echo "❌ MongoDB failed to start after 60 seconds"
+                echo "MongoDB logs:"
+                docker logs school-mongo --tail 50
+                echo "MongoDB container status:"
+                docker ps -a | grep mongo
+                exit 1
+              fi
+              echo "⏳ Waiting for MongoDB... ($i/30)"
+              sleep 2
+            done
+            
+            # Verify MongoDB container is in the network
+            echo "🔍 Verifying MongoDB network..."
+            if ! docker network inspect school-network | grep -q school-mongo; then
+              echo "⚠️ MongoDB container not in network, recreating..."
+              $COMPOSE_CMD up -d --force-recreate mongo
+              sleep 5
+            fi
+            
+            # Start/update web service
+            echo "🚀 Starting web service..."
             $COMPOSE_CMD up -d --no-deps web
             
             # Verify containers are running
