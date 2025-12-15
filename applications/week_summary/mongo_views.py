@@ -11,8 +11,10 @@ import logging
 
 from applications.common.mongo import get_mongo_collection, to_plain
 from applications.common.responses import ok, created, bad_request, not_found, server_error
+from applications.common.academic_year import get_academic_year_settings
 from bson import ObjectId
 from .week_milestone import WeekMilestoneManager
+from .mongo_serializers import ClassroomDetailResponseSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -86,17 +88,19 @@ def mongo_realtime_rankings(request):
 
         # Resolve date range
         try:
+            ay_cfg = get_academic_year_settings()
+
             if week_number and year:
-                # Tính tuần từ mốc 6/10/2025
+                # Tính tuần từ mốc competition_start_date của niên khoá tương ứng
                 week = int(week_number)
-                milestone_date = datetime(2025, 10, 6)  # Mốc tuần đầu tiên
-                start_dt = milestone_date + timedelta(weeks=week-1)
+                competition_start = datetime.fromisoformat(ay_cfg.competition_start_date)
+                start_dt = competition_start + timedelta(weeks=week-1)
                 end_dt = start_dt + timedelta(days=6)
             elif start_date_str and end_date_str:
                 start_dt = datetime.fromisoformat(start_date_str)
                 end_dt = datetime.fromisoformat(end_date_str)
             else:
-                # Sử dụng mốc tuần nếu không có tham số
+                # Sử dụng mốc tuần hiện tại từ WeekMilestoneManager (đã được gắn với academic_year)
                 week_info = WeekMilestoneManager.get_week_info()
                 current_week = week_info['current_week']
                 current_year = week_info['current_year']
@@ -107,14 +111,15 @@ def mongo_realtime_rankings(request):
 
         # Get events from MongoDB
         events_coll = get_mongo_collection('events')
-        
+
         # Build query for events in date range - chỉ lấy events đã được duyệt
         query = {
             'date': {
                 '$gte': start_dt.strftime('%Y-%m-%d'),
                 '$lte': end_dt.strftime('%Y-%m-%d')
             },
-            'approval_status': 'approved'  # Chỉ tính events đã được duyệt
+            'approval_status': 'approved',  # Chỉ tính events đã được duyệt
+            'academic_year': get_academic_year_settings().academic_year,
         }
         
         # Role-based filtering - Chỉ admin mới được xem rankings
@@ -230,6 +235,177 @@ def mongo_realtime_rankings(request):
         
     except Exception as exc:
         logger.exception('mongo_realtime_rankings error')
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def mongo_realtime_classroom_detail(request):
+    """
+    Trả về chi tiết điểm cộng/điểm trừ cho 1 lớp trong khoảng thời gian (tuần) được chọn.
+    Query params:
+      - classroom_id (bắt buộc)
+      - week_number + year (tùy chọn) HOẶC start_date + end_date (ISO)
+    """
+    try:
+        user = request.user
+        classroom_id = request.query_params.get('classroom_id')
+        week_number = request.query_params.get('week_number')
+        year = request.query_params.get('year')
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+
+        if not classroom_id:
+            return Response({'error': 'classroom_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Chỉ admin mới xem chi tiết bảng xếp hạng
+        if getattr(user, 'role', None) != 'admin':
+            return Response({'error': 'Chỉ admin mới có quyền xem chi tiết điểm thi đua'}, status=status.HTTP_403_FORBIDDEN)
+
+        # Resolve date range (tái sử dụng logic từ mongo_realtime_rankings)
+        try:
+            if week_number and year:
+                week = int(week_number)
+                milestone_date = datetime(2025, 10, 6)  # Mốc tuần đầu tiên
+                start_dt = milestone_date + timedelta(weeks=week-1)
+                end_dt = start_dt + timedelta(days=6)
+            elif start_date_str and end_date_str:
+                start_dt = datetime.fromisoformat(start_date_str)
+                end_dt = datetime.fromisoformat(end_date_str)
+            else:
+                week_info = WeekMilestoneManager.get_week_info()
+                current_week = week_info['current_week']
+                current_year = week_info['current_year']
+                start_dt = datetime.fromisocalendar(current_year, current_week, 1)
+                end_dt = datetime.fromisocalendar(current_year, current_week, 7)
+        except ValueError:
+            return Response({'error': 'Invalid date/week parameters'}, status=status.HTTP_400_BAD_REQUEST)
+
+        ay_cfg = get_academic_year_settings()
+
+        events_coll = get_mongo_collection('events')
+        classrooms_coll = get_mongo_collection('classrooms')
+        users_coll = get_mongo_collection('users')
+        event_types_coll = get_mongo_collection('event_types')
+
+        query = {
+            'date': {
+                '$gte': start_dt.strftime('%Y-%m-%d'),
+                '$lte': end_dt.strftime('%Y-%m-%d')
+            },
+            'approval_status': 'approved',
+            'classroom_id': classroom_id,
+            'academic_year': ay_cfg.academic_year,
+        }
+
+        events = list(events_coll.find(query))
+
+        # Lấy tên lớp
+        classroom_doc = None
+        try:
+            classroom_doc = classrooms_coll.find_one({'_id': ObjectId(classroom_id)})
+        except Exception:
+            classroom_doc = classrooms_coll.find_one({'id': classroom_id})
+
+        classroom_name = classroom_doc.get('full_name', '') if classroom_doc else ''
+
+        detailed_events = []
+        total_positive = 0
+        total_negative = 0
+        total_points = 0
+
+        # Cache tránh query lặp
+        event_type_cache = {}
+        student_cache = {}
+
+        for event_doc in events:
+            date_str = event_doc.get('date')
+            periods = event_doc.get('periods', {})
+
+            for period_key, period_events in periods.items():
+                try:
+                    period_num = int(period_key)
+                except Exception:
+                    period_num = 0
+
+                for ev in period_events:
+                    points = ev.get('points', 0)
+                    et_key = ev.get('event_type_key', '')
+                    et_id = ev.get('event_type')
+                    student_id = ev.get('student_id') or ev.get('student')
+
+                    if points > 0:
+                        total_positive += points
+                    elif points < 0:
+                        total_negative += abs(points)
+                    total_points += points
+
+                    # Lấy thông tin loại sự kiện
+                    et_name = ''
+                    cache_key = et_key or et_id
+                    if cache_key:
+                        if cache_key in event_type_cache:
+                            et_name = event_type_cache[cache_key]
+                        else:
+                            et_query = {}
+                            if et_key:
+                                et_query['key'] = et_key
+                            if et_id:
+                                try:
+                                    et_query['_id'] = ObjectId(et_id)
+                                except Exception:
+                                    et_query['id'] = et_id
+                            if et_query:
+                                et_doc = event_types_coll.find_one(et_query)
+                                if et_doc:
+                                    et_name = et_doc.get('name', '') or et_doc.get('title', '')
+                                    event_type_cache[cache_key] = et_name
+
+                    # Lấy thông tin học sinh
+                    student_name = ''
+                    if student_id:
+                        sid = str(student_id)
+                        if sid in student_cache:
+                            student_name = student_cache[sid]
+                        else:
+                            try:
+                                stu_doc = users_coll.find_one({'_id': ObjectId(student_id)})
+                            except Exception:
+                                stu_doc = users_coll.find_one({'id': student_id})
+                            if stu_doc:
+                                student_name = stu_doc.get('full_name') or f"{stu_doc.get('first_name', '')} {stu_doc.get('last_name', '')}".strip()
+                                student_cache[sid] = student_name
+
+                    detailed_events.append({
+                        'date': date_str,
+                        'period': period_num,
+                        'event_type_key': et_key,
+                        'event_type_name': et_name,
+                        'student_id': str(student_id) if student_id else '',
+                        'student_name': student_name,
+                        'points': points,
+                        'description': ev.get('description', ''),
+                    })
+
+        # Sắp xếp sự kiện: mới nhất → cũ nhất (ngày giảm dần, rồi tiết giảm dần)
+        detailed_events.sort(key=lambda x: (x['date'], x['period']), reverse=True)
+
+        resp_data = {
+            'classroom_id': classroom_id,
+            'classroom_name': classroom_name,
+            'week_number': int(week_number) if week_number else start_dt.isocalendar()[1],
+            'year': int(year) if year else start_dt.year,
+            'total_positive': total_positive,
+            'total_negative': total_negative,
+            'total_points': total_points,
+            'events': detailed_events,
+        }
+
+        serializer = ClassroomDetailResponseSerializer(resp_data)
+        return Response(serializer.data)
+
+    except Exception as exc:
+        logger.exception('mongo_realtime_classroom_detail error')
         return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 

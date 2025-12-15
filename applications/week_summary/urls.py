@@ -14,6 +14,7 @@ urlpatterns = [
     
     # Rankings API - MongoDB
     path('rankings/realtime', mongo_views.mongo_realtime_rankings, name='realtime-rankings'),
+    path('rankings/realtime/classroom-detail', mongo_views.mongo_realtime_classroom_detail, name='realtime-classroom-detail'),
     
     # Week Milestone API
     path('milestone', mongo_views.mongo_week_milestone, name='week-milestone'),

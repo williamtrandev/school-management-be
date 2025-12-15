@@ -4,6 +4,7 @@ Hệ thống đánh dấu mốc tuần đầu tiên
 
 from datetime import datetime
 from applications.common.mongo import get_mongo_collection, to_plain
+from applications.common.academic_year import get_academic_year_settings, get_academic_year_from_date
 
 class WeekMilestoneManager:
     """Quản lý mốc tuần đầu tiên của hệ thống"""
@@ -14,23 +15,29 @@ class WeekMilestoneManager:
         
         milestones_coll = get_mongo_collection('week_milestones')
         
-        # Kiểm tra xem đã có mốc tuần chưa
-        milestone = milestones_coll.find_one({'is_active': True})
+        # Lấy niên khoá hiện tại
+        ay_cfg = get_academic_year_settings()
+        ay = ay_cfg.academic_year
+        
+        # Kiểm tra xem đã có mốc tuần active cho niên khoá hiện tại chưa
+        milestone = milestones_coll.find_one({'is_active': True, 'academic_year': ay})
         
         if milestone:
             return to_plain(milestone)
         
-        # Tạo mốc tuần đầu tiên
-        today = datetime.now()
+        # Nếu chưa có, tạo mốc tuần đầu tiên cho niên khoá hiện tại
+        start_date_str = ay_cfg.competition_start_date
+        today = datetime.fromisoformat(start_date_str)
         current_week = today.isocalendar()[1]
         current_year = today.year
         
         milestone_doc = {
-            'start_date': today.strftime('%Y-%m-%d'),
+            'start_date': start_date_str,
             'week_number': current_week,
             'year': current_year,
+            'academic_year': ay,
             'created_at': datetime.now().isoformat(),
-            'description': f'Tuần đầu tiên của hệ thống - Tuần {current_week}/{current_year}',
+            'description': f'Tuần đầu tiên của hệ thống ({ay}) - Tuần {current_week}/{current_year}',
             'is_active': True
         }
         
@@ -82,9 +89,16 @@ class WeekMilestoneManager:
         
         milestones_coll = get_mongo_collection('week_milestones')
         
-        # Xóa mốc tuần cũ
-        milestones_coll.delete_many({})
+        # Lấy niên khoá hiện tại
+        ay_cfg = get_academic_year_settings()
+        ay = ay_cfg.academic_year
         
-        # Tạo mốc tuần mới
+        # Deactivate tất cả milestone của niên khoá hiện tại
+        milestones_coll.update_many(
+            {'academic_year': ay},
+            {'$set': {'is_active': False}}
+        )
+        
+        # Tạo mốc tuần mới cho niên khoá hiện tại
         milestone = WeekMilestoneManager.get_or_create_week_milestone()
         return to_plain(milestone)

@@ -1128,6 +1128,23 @@ def mongo_events_public(request):
         logger.exception('mongo_events_public error')
         return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+def get_absence_periods(attendance_code: str) -> int:
+    """
+    Calculate number of absence periods (sessions) from attendance code.
+    1 day = 2 periods (morning + afternoon)
+    Full day absence = 2 periods, Half day absence = 1 period
+    """
+    # Full day absence: 2 periods
+    # spck = sáng có phép + chiều không phép = 2 buổi
+    # skcp = sáng không phép + chiều có phép = 2 buổi
+    if attendance_code in ['attendance_spcp', 'attendance_skck', 
+                          'attendance_spck', 'attendance_skcp']:
+        return 2
+    # Half day absence: 1 period
+    if attendance_code in ['attendance_sp', 'attendance_cp', 'attendance_sk', 'attendance_ck']:
+        return 1
+    return 0
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def mongo_attendance_export(request):
@@ -1365,9 +1382,9 @@ def mongo_attendance_export(request):
             
             # Write attendance for each day (only actual days in month)
             col = 4
-            total_absences = 0
-            total_excused = 0
-            total_unexcused = 0
+            total_absence_periods = 0  # Total absence periods (sessions), not days
+            total_excused_periods = 0   # Total excused absence periods
+            total_unexcused_periods = 0 # Total unexcused absence periods
             
             # Map attendance code to display
             code_map = {
@@ -1390,21 +1407,39 @@ def mongo_attendance_export(request):
                     display_code = code_map.get(attendance_code, '')
                     ws.cell(row=row, column=col, value=display_code).border = border
                     if display_code:
-                        total_absences += 1
-                        # Count excused (spcp, sp, cp) and unexcused (skck, sk, ck, spck, skcp)
-                        if attendance_code in ['attendance_spcp', 'attendance_sp', 'attendance_cp']:
-                            total_excused += 1
-                        else:
-                            total_unexcused += 1
+                        # Calculate absence periods (sessions) for this day
+                        periods = get_absence_periods(attendance_code)
+                        total_absence_periods += periods
+                        
+                        # Count excused and unexcused periods
+                        # Excused: spcp (2 periods), sp (1 period), cp (1 period)
+                        # Unexcused: skck (2 periods), sk (1 period), ck (1 period)
+                        # Mixed: spck (1 excused + 1 unexcused = 2 periods), skcp (1 unexcused + 1 excused = 2 periods)
+                        if attendance_code == 'attendance_spcp':
+                            total_excused_periods += 2
+                        elif attendance_code == 'attendance_skck':
+                            total_unexcused_periods += 2
+                        elif attendance_code in ['attendance_sp', 'attendance_cp']:
+                            total_excused_periods += 1
+                        elif attendance_code in ['attendance_sk', 'attendance_ck']:
+                            total_unexcused_periods += 1
+                        elif attendance_code == 'attendance_spck':
+                            # Sáng có phép + chiều không phép = 1 buổi có phép + 1 buổi không phép
+                            total_excused_periods += 1
+                            total_unexcused_periods += 1
+                        elif attendance_code == 'attendance_skcp':
+                            # Sáng không phép + chiều có phép = 1 buổi không phép + 1 buổi có phép
+                            total_unexcused_periods += 1
+                            total_excused_periods += 1
                 else:
                     # Empty cell
                     ws.cell(row=row, column=col, value='').border = border
                 col += 1
             
-            # Summary columns
-            ws.cell(row=row, column=col, value=total_absences).border = border  # TS
-            ws.cell(row=row, column=col+1, value=total_excused).border = border  # P
-            ws.cell(row=row, column=col+2, value=total_unexcused).border = border  # K
+            # Summary columns - TS Buổi nghỉ (total absence periods)
+            ws.cell(row=row, column=col, value=total_absence_periods).border = border  # TS (total periods)
+            ws.cell(row=row, column=col+1, value=total_excused_periods).border = border  # P (excused periods)
+            ws.cell(row=row, column=col+2, value=total_unexcused_periods).border = border  # K (unexcused periods)
             ws.cell(row=row, column=col+3, value=0).border = border  # TS bỏ tiết
             
             row += 1

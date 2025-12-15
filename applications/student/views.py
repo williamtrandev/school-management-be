@@ -74,12 +74,60 @@ def mongo_students_list(request):
 
         docs = list(coll.find(query).sort('full_name', 1).skip(skip_count).limit(page_size))
 
+        # Get all unique classroom_ids to populate classroom_name
+        classroom_ids = set()
+        classroom_id_to_str = {}  # Map original classroom_id to string version
+        for d in docs:
+            classroom_id = d.get('classroom_id')
+            if classroom_id:
+                # Convert to string for consistent mapping
+                classroom_id_str = str(classroom_id) if not isinstance(classroom_id, str) else classroom_id
+                classroom_ids.add(classroom_id_str)
+                # Store mapping from original to string
+                if isinstance(classroom_id, ObjectId):
+                    classroom_id_to_str[str(classroom_id)] = str(classroom_id)
+                else:
+                    classroom_id_to_str[classroom_id] = classroom_id
+        
+        # Fetch classroom names
+        classrooms_coll = get_mongo_collection('classrooms')
+        classroom_map = {}
+        if classroom_ids:
+            # Convert string IDs to ObjectId for query
+            object_ids = []
+            for cid in classroom_ids:
+                try:
+                    if ObjectId.is_valid(cid):
+                        object_ids.append(ObjectId(cid))
+                except:
+                    pass
+            
+            if object_ids:
+                classroom_docs = classrooms_coll.find({'_id': {'$in': object_ids}})
+                for cd in classroom_docs:
+                    cd_plain = to_plain(cd)
+                    classroom_id_str = cd_plain.get('id', '')
+                    classroom_name = cd_plain.get('full_name') or cd_plain.get('name', '')
+                    # Map both string and ObjectId versions
+                    classroom_map[classroom_id_str] = classroom_name
+                    # Also map ObjectId version if different
+                    if str(cd.get('_id')) != classroom_id_str:
+                        classroom_map[str(cd.get('_id'))] = classroom_name
+
         out = []
         for d in docs:
             t = to_plain(d)
             # ensure created_at/updated_at
             t['created_at'] = t.get('created_at') or ''
             t['updated_at'] = t.get('updated_at') or t['created_at']
+            # Populate classroom_name from classroom_id
+            classroom_id = t.get('classroom_id')
+            if classroom_id:
+                # Convert to string for lookup
+                classroom_id_str = str(classroom_id) if not isinstance(classroom_id, str) else classroom_id
+                t['classroom_name'] = classroom_map.get(classroom_id_str, '')
+            else:
+                t['classroom_name'] = ''
             out.append(t)
 
         return Response({
