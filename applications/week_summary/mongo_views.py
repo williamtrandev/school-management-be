@@ -5,7 +5,7 @@ MongoDB-based week summary views - Thay thế MySQL
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from datetime import datetime, timedelta
 import logging
 
@@ -76,11 +76,10 @@ def mongo_debug_events(request):
         return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def mongo_realtime_rankings(request):
     """Compute rankings in real-time from MongoDB events for a given week/year or date range."""
     try:
-        user = request.user
         week_number = request.query_params.get('week_number')
         year = request.query_params.get('year')
         start_date_str = request.query_params.get('start_date')
@@ -121,14 +120,6 @@ def mongo_realtime_rankings(request):
             'approval_status': 'approved',  # Chỉ tính events đã được duyệt
             'academic_year': get_academic_year_settings().academic_year,
         }
-        
-        # Role-based filtering - Chỉ admin mới được xem rankings
-        if user.role == 'student':
-            return Response({'error': 'Học sinh không có quyền xem xếp hạng'}, status=status.HTTP_403_FORBIDDEN)
-        elif user.role == 'teacher':
-            return Response({'error': 'Giáo viên không có quyền xem xếp hạng'}, status=status.HTTP_403_FORBIDDEN)
-        elif user.role != 'admin':
-            return Response({'error': 'Chỉ admin mới có quyền xem xếp hạng'}, status=status.HTTP_403_FORBIDDEN)
         
         # Get all events in date range
         events = list(events_coll.find(query))
@@ -239,7 +230,7 @@ def mongo_realtime_rankings(request):
 
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def mongo_realtime_classroom_detail(request):
     """
     Trả về chi tiết điểm cộng/điểm trừ cho 1 lớp trong khoảng thời gian (tuần) được chọn.
@@ -248,7 +239,6 @@ def mongo_realtime_classroom_detail(request):
       - week_number + year (tùy chọn) HOẶC start_date + end_date (ISO)
     """
     try:
-        user = request.user
         classroom_id = request.query_params.get('classroom_id')
         week_number = request.query_params.get('week_number')
         year = request.query_params.get('year')
@@ -257,10 +247,6 @@ def mongo_realtime_classroom_detail(request):
 
         if not classroom_id:
             return Response({'error': 'classroom_id is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Chỉ admin mới xem chi tiết bảng xếp hạng
-        if getattr(user, 'role', None) != 'admin':
-            return Response({'error': 'Chỉ admin mới có quyền xem chi tiết điểm thi đua'}, status=status.HTTP_403_FORBIDDEN)
 
         # Resolve date range (tái sử dụng logic từ mongo_realtime_rankings)
         try:
