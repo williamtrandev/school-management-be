@@ -6,6 +6,7 @@ from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
+from applications.permissions import IsAdminOrTeacherOrDormSupervisor
 from datetime import datetime, timedelta
 import uuid
 import logging
@@ -241,15 +242,15 @@ def mongo_events_optimized_list(request):
         
         logger.info(f"Final query: {query}")
 
-        # Count total documents
-        total_count = coll.count_documents(query)
-        total_pages = (total_count + page_size - 1) // page_size
-        
+        # Get all documents matching query (không paginate ngay vì cần filter trước)
+        # Để tối ưu, ta vẫn có thể paginate nhưng sẽ phải load nhiều hơn để đảm bảo có đủ documents sau filter
+        # Tạm thời load nhiều hơn một chút để đảm bảo có đủ kết quả sau filter
         # Calculate skip
         skip = (page - 1) * page_size
+        # Load thêm một số documents để đảm bảo sau khi filter vẫn có đủ page_size documents
+        load_limit = page_size * 3  # Load gấp 3 lần để đảm bảo có đủ sau filter
         
-        # Get paginated results
-        docs = list(coll.find(query).sort('date', -1).skip(skip).limit(page_size))
+        docs = list(coll.find(query).sort('date', -1).skip(skip).limit(load_limit))
         
         out = []
         for d in docs:
@@ -257,16 +258,35 @@ def mongo_events_optimized_list(request):
             t['created_at'] = t.get('created_at') or ''
             t['updated_at'] = t.get('updated_at') or t['created_at']
             
-            # Không tạo events field nữa, chỉ giữ periods format
-            
-            out.append(t)
+            # Loại bỏ period "attendance" và "sudden" (violation) khỏi hoạt động trong ngày
+            periods = t.get('periods', {})
+            if isinstance(periods, dict):
+                filtered_periods = {k: v for k, v in periods.items() if k not in ['attendance', 'sudden']}
+                
+                # Chỉ thêm document vào kết quả nếu còn periods sau khi filter
+                if filtered_periods:
+                    t['periods'] = filtered_periods
+                    out.append(t)
+                    # Dừng khi đã có đủ page_size documents
+                    if len(out) >= page_size:
+                        break
+        
+        # Count tổng số documents có events sau khi filter
+        # Để chính xác, ta cần đếm tất cả documents (không paginate)
+        # Nhưng điều này tốn kém, nên ta sẽ estimate dựa trên tỷ lệ
+        # Hoặc đơn giản hơn: chỉ trả về count của page hiện tại
+        filtered_count = len(out)
         
         # Build pagination URLs
         base_url = request.build_absolute_uri().split('?')[0]
         params = request.GET.copy()
         
+        # Estimate total pages dựa trên tỷ lệ filtered/total trong page này
+        # Nếu có ít hơn page_size documents sau filter, có thể đã hết
+        has_more = len(docs) == load_limit and filtered_count >= page_size
+        
         next_url = None
-        if page < total_pages:
+        if has_more:
             params['page'] = page + 1
             next_url = f"{base_url}?{params.urlencode()}"
         
@@ -277,10 +297,10 @@ def mongo_events_optimized_list(request):
         
         return Response({
             'results': out,
-            'count': total_count,
+            'count': filtered_count,  # Count của page hiện tại sau filter
             'page': page,
             'page_size': page_size,
-            'total_pages': total_pages,
+            'total_pages': 0 if filtered_count == 0 else (page + (1 if has_more else 0)),  # Estimate
             'next': next_url,
             'previous': previous_url
         }, status=status.HTTP_200_OK)
@@ -365,7 +385,6 @@ def mongo_events_optimized_detail(request):
             for et in event_types_coll.find({'key': {'$in': list(event_type_keys)}}):
                 type_map[et.get('key')] = et.get('name')
         
-        # Enrich periods with names
         for period_num, period_events in periods.items():
             for event in period_events:
                 # Add student_name
@@ -375,7 +394,6 @@ def mongo_events_optimized_detail(request):
                 # Add event_type_name
                 if event.get('event_type_key') and event['event_type_key'] in type_map:
                     event['event_type_name'] = type_map[event['event_type_key']]
-        
         return ok(t)
     except Exception as exc:
         logging.getLogger(__name__).exception('mongo_events_optimized_detail error')
@@ -428,12 +446,16 @@ def mongo_events_optimized_create(request):
                 }
             if period_key not in events_by_date_class[day_key]['periods']:
                 events_by_date_class[day_key]['periods'][period_key] = []
-            events_by_date_class[day_key]['periods'][period_key].append({
+            event_obj = {
                 'event_type_key': evt.get('event_type_key'),
                 'student_id': evt.get('student_id') or evt.get('student'),
                 'points': evt.get('points', 0),
                 'description': evt.get('description', ''),
-            })
+            }
+            # Add session field if present (for attendance: morning/afternoon)
+            if evt.get('session'):
+                event_obj['session'] = evt.get('session')
+            events_by_date_class[day_key]['periods'][period_key].append(event_obj)
 
         # CASE A: periods payload provided (preferred)
         if isinstance(periods_payload, dict):
@@ -466,10 +488,12 @@ def mongo_events_optimized_create(request):
                         'event_type': et_id,
                         'event_type_key': et_key,
                         'student': ev.get('student_id') or ev.get('student'),
+                        'student_id': ev.get('student_id') or ev.get('student'),  # Ensure student_id is present
                         'points': ev.get('points', 0),
                         'description': ev.get('description', ''),
                         'date': date,
                         'classroom': classroom_id,
+                        'session': ev.get('session'),  # Support session field for attendance (morning/afternoon)
                     }
                     push_event(day_key, period_key, ev_comp)
         else:
@@ -542,9 +566,48 @@ def mongo_events_optimized_create(request):
             })
             
             if existing:
+                # Merge periods thay vì replace để không mất dữ liệu cũ
+                existing_periods = existing.get('periods', {})
+                merged_periods = existing_periods.copy()
+                
+                # Merge từng period mới vào periods hiện có
+                for period_key, new_events in day_data['periods'].items():
+                    if period_key not in merged_periods:
+                        # Period mới, thêm trực tiếp
+                        merged_periods[period_key] = new_events
+                    else:
+                        # Period đã tồn tại
+                        if period_key == 'attendance':
+                            # Với attendance, replace toàn bộ để đảm bảo xóa được events đã bị xóa ở frontend
+                            merged_periods[period_key] = new_events
+                        else:
+                            # Với các period khác, merge events
+                            existing_events = merged_periods[period_key]
+                            # Tạo map để dễ tìm và replace events trùng lặp
+                            # Key: (student_id, session) hoặc (student_id,) nếu không có session
+                            event_map = {}
+                            for ev in existing_events:
+                                student_id = str(ev.get('student_id') or ev.get('student') or '')
+                                session = ev.get('session', '')
+                                key = (student_id, session) if session else (student_id,)
+                                event_map[key] = ev
+                            
+                            # Thêm/thay thế events mới
+                            for new_ev in new_events:
+                                student_id = str(new_ev.get('student_id') or new_ev.get('student') or '')
+                                session = new_ev.get('session', '')
+                                key = (student_id, session) if session else (student_id,)
+                                event_map[key] = new_ev
+                            
+                            # Chuyển lại thành list
+                            merged_periods[period_key] = list(event_map.values())
+                
+                # Tính lại total_events sau khi merge
+                total_events = sum(len(period_events) for period_events in merged_periods.values())
+                
                 # Cập nhật document hiện có
                 update_data = {
-                    'periods': day_data['periods'],
+                    'periods': merged_periods,
                     'total_events': total_events,
                     'updated_at': datetime.now().isoformat(),
                 }
@@ -571,6 +634,8 @@ def mongo_events_optimized_create(request):
                     {'$set': update_data}
                 )
                 day_doc['_id'] = existing['_id']
+                day_doc['periods'] = merged_periods
+                day_doc['total_events'] = total_events
             else:
                 # Tạo document mới
                 result = events_coll.insert_one(day_doc)
@@ -670,12 +735,16 @@ def mongo_events_optimized_replace(request):
                             et_key = et_doc2.get('key')
                     except Exception:
                         pass
-                periods[period].append({
+                event_obj = {
                     'event_type_key': et_key,
                     'student_id': event_data.get('student'),
                     'points': event_data.get('points', 0),
                     'description': event_data.get('description', ''),
-                })
+                }
+                # Add session field if present (for attendance: morning/afternoon)
+                if event_data.get('session'):
+                    event_obj['session'] = event_data.get('session')
+                periods[period].append(event_obj)
         
         # Tạo document mới
         day_doc = {
@@ -1128,6 +1197,57 @@ def mongo_events_public(request):
         logger.exception('mongo_events_public error')
         return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+def derive_attendance_type(morning: str, afternoon: str) -> str:
+    """
+    Suy luận loại nghỉ từ morning và afternoon.
+    Returns: attendance code (legacy format hoặc session-based)
+    """
+    has_morning = morning and morning in ['attendance_sp', 'attendance_sk']
+    has_afternoon = afternoon and afternoon in ['attendance_cp', 'attendance_ck']
+    
+    if has_morning and has_afternoon:
+        # Nghỉ cả ngày
+        if morning == 'attendance_sp' and afternoon == 'attendance_cp':
+            return 'attendance_spcp'
+        elif morning == 'attendance_sk' and afternoon == 'attendance_ck':
+            return 'attendance_skck'
+        elif morning == 'attendance_sp' and afternoon == 'attendance_ck':
+            return 'attendance_spck'
+        elif morning == 'attendance_sk' and afternoon == 'attendance_cp':
+            return 'attendance_skcp'
+    elif has_morning:
+        return morning  # SP hoặc SK
+    elif has_afternoon:
+        return afternoon  # CP hoặc CK
+    
+    return ''
+
+def get_absence_periods_from_sessions(morning: str, afternoon: str) -> int:
+    """Tính số buổi nghỉ từ morning và afternoon"""
+    periods = 0
+    if morning and morning in ['attendance_sp', 'attendance_sk']:
+        periods += 1
+    if afternoon and afternoon in ['attendance_cp', 'attendance_ck']:
+        periods += 1
+    return periods
+
+def get_excused_unexcused_periods(morning: str, afternoon: str) -> dict:
+    """Tính số buổi có phép và không phép"""
+    excused = 0
+    unexcused = 0
+    
+    if morning == 'attendance_sp':
+        excused += 1
+    elif morning == 'attendance_sk':
+        unexcused += 1
+    
+    if afternoon == 'attendance_cp':
+        excused += 1
+    elif afternoon == 'attendance_ck':
+        unexcused += 1
+    
+    return {'excused': excused, 'unexcused': unexcused}
+
 def get_absence_periods(attendance_code: str) -> int:
     """
     Calculate number of absence periods (sessions) from attendance code.
@@ -1195,14 +1315,57 @@ def mongo_attendance_export(request):
             attendance_events = event_doc.get('periods', {}).get('attendance', [])
             if date not in attendance_data:
                 attendance_data[date] = {}
+            
+            # Group attendance events by student_id to handle session-based data
+            student_sessions = {}
             for att_event in attendance_events:
                 student_id = att_event.get('student_id')
                 # Convert ObjectId to string if needed
                 if student_id and hasattr(student_id, '__str__'):
                     student_id = str(student_id)
+                else:
+                    student_id = str(student_id) if student_id else ''
+                
+                if not student_id:
+                    continue
+                
                 event_type_key = att_event.get('event_type_key', '')
-                if student_id:
-                    attendance_data[date][student_id] = event_type_key
+                session = att_event.get('session', 'morning')  # Default to morning if not specified
+                
+                if student_id not in student_sessions:
+                    student_sessions[student_id] = {'morning': '', 'afternoon': ''}
+                
+                # Map to morning/afternoon based on session or event type
+                if session == 'morning' or event_type_key in ['attendance_sp', 'attendance_sk']:
+                    student_sessions[student_id]['morning'] = event_type_key
+                elif session == 'afternoon' or event_type_key in ['attendance_cp', 'attendance_ck']:
+                    student_sessions[student_id]['afternoon'] = event_type_key
+                else:
+                    # Legacy format - try to derive from event_type_key
+                    legacy_map = {
+                        'attendance_spcp': {'morning': 'attendance_sp', 'afternoon': 'attendance_cp'},
+                        'attendance_skck': {'morning': 'attendance_sk', 'afternoon': 'attendance_ck'},
+                        'attendance_spck': {'morning': 'attendance_sp', 'afternoon': 'attendance_ck'},
+                        'attendance_skcp': {'morning': 'attendance_sk', 'afternoon': 'attendance_cp'},
+                    }
+                    if event_type_key in legacy_map:
+                        mapped = legacy_map[event_type_key]
+                        student_sessions[student_id]['morning'] = mapped['morning']
+                        student_sessions[student_id]['afternoon'] = mapped['afternoon']
+                    else:
+                        # Fallback: store as-is (legacy single code)
+                        attendance_data[date][student_id] = event_type_key
+            
+            # Derive attendance type from sessions for each student
+            for student_id, sessions in student_sessions.items():
+                morning = sessions.get('morning', '')
+                afternoon = sessions.get('afternoon', '')
+                
+                if morning or afternoon:
+                    # Use helper function to derive attendance type
+                    derived_type = derive_attendance_type(morning, afternoon)
+                    if derived_type:
+                        attendance_data[date][student_id] = derived_type
         
         # Create Excel workbook
         wb = Workbook()
@@ -1412,25 +1575,33 @@ def mongo_attendance_export(request):
                         total_absence_periods += periods
                         
                         # Count excused and unexcused periods
-                        # Excused: spcp (2 periods), sp (1 period), cp (1 period)
-                        # Unexcused: skck (2 periods), sk (1 period), ck (1 period)
-                        # Mixed: spck (1 excused + 1 unexcused = 2 periods), skcp (1 unexcused + 1 excused = 2 periods)
-                        if attendance_code == 'attendance_spcp':
-                            total_excused_periods += 2
-                        elif attendance_code == 'attendance_skck':
-                            total_unexcused_periods += 2
-                        elif attendance_code in ['attendance_sp', 'attendance_cp']:
-                            total_excused_periods += 1
-                        elif attendance_code in ['attendance_sk', 'attendance_ck']:
-                            total_unexcused_periods += 1
-                        elif attendance_code == 'attendance_spck':
-                            # Sáng có phép + chiều không phép = 1 buổi có phép + 1 buổi không phép
-                            total_excused_periods += 1
-                            total_unexcused_periods += 1
-                        elif attendance_code == 'attendance_skcp':
-                            # Sáng không phép + chiều có phép = 1 buổi không phép + 1 buổi có phép
-                            total_unexcused_periods += 1
-                            total_excused_periods += 1
+                        # For legacy codes, use direct mapping
+                        # For session-based codes, derive from sessions if needed
+                        if attendance_code in ['attendance_spcp', 'attendance_skck', 'attendance_spck', 'attendance_skcp']:
+                            # Legacy full-day codes
+                            if attendance_code == 'attendance_spcp':
+                                total_excused_periods += 2
+                            elif attendance_code == 'attendance_skck':
+                                total_unexcused_periods += 2
+                            elif attendance_code == 'attendance_spck':
+                                # Sáng có phép + chiều không phép = 1 buổi có phép + 1 buổi không phép
+                                total_excused_periods += 1
+                                total_unexcused_periods += 1
+                            elif attendance_code == 'attendance_skcp':
+                                # Sáng không phép + chiều có phép = 1 buổi không phép + 1 buổi có phép
+                                total_unexcused_periods += 1
+                                total_excused_periods += 1
+                        else:
+                            # Session-based codes (SP, SK, CP, CK) - use helper function
+                            # Since we already derived the type, we can use direct mapping
+                            if attendance_code == 'attendance_sp':
+                                total_excused_periods += 1
+                            elif attendance_code == 'attendance_sk':
+                                total_unexcused_periods += 1
+                            elif attendance_code == 'attendance_cp':
+                                total_excused_periods += 1
+                            elif attendance_code == 'attendance_ck':
+                                total_unexcused_periods += 1
                 else:
                     # Empty cell
                     ws.cell(row=row, column=col, value='').border = border

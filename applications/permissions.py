@@ -29,6 +29,20 @@ class IsAdminOrTeacher(permissions.BasePermission):
         return request.user.is_authenticated and request.user.role in ['admin', 'teacher']
 
 
+class IsDormSupervisorUser(permissions.BasePermission):
+    """Chỉ cho phép Quản sinh truy cập"""
+    
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and request.user.role == 'dorm_supervisor'
+
+
+class IsAdminOrTeacherOrDormSupervisor(permissions.BasePermission):
+    """Cho phép Admin, Giáo viên hoặc Quản sinh truy cập"""
+    
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and request.user.role in ['admin', 'teacher', 'dorm_supervisor']
+
+
 class IsReadOnlyForStudent(permissions.BasePermission):
     """Cho phép học sinh chỉ đọc"""
     

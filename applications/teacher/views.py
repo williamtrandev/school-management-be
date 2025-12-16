@@ -437,6 +437,10 @@ def mongo_teachers_list(request):
         subject = request.query_params.get('subject')
         search = request.query_params.get('search')
         ordering = request.query_params.get('ordering', 'full_name')
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 12))
+        page = max(1, page)
+        page_size = max(1, min(200, page_size))
         
         query = {'role': 'teacher'}  # Only get teachers
         if subject:
@@ -450,8 +454,10 @@ def mongo_teachers_list(request):
                 {'email': {'$regex': search, '$options': 'i'}},
                 {'subject': {'$regex': search, '$options': 'i'}},
             ]
-        
-        docs = list(coll.find(query).sort(ordering, 1))
+
+        total_count = coll.count_documents(query)
+        skip_count = (page - 1) * page_size
+        docs = list(coll.find(query).sort(ordering, 1).skip(skip_count).limit(page_size))
         result = []
         for d in docs:
             t = to_plain(d)
@@ -475,7 +481,13 @@ def mongo_teachers_list(request):
                 'homeroom_class': t.get('homeroom_class', ''),
                 'homeroom_class_id': t.get('homeroom_class_id', '')
             })
-        return Response(result)
+        return Response({
+            'results': result,
+            'total': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total_count + page_size - 1) // page_size,
+        })
     except Exception as exc:
         logging.getLogger(__name__).exception('mongo_teachers_list error')
         return server_error(exc)
