@@ -470,32 +470,46 @@ def mongo_events_optimized_create(request):
             for period_key, events in periods_payload.items():
                 if not isinstance(events, list):
                     continue
-                for ev in events:
-                    # Map key->id if needed
-                    et_id = ev.get('event_type')
-                    et_key = ev.get('event_type_key')
-                    if not et_id and et_key:
-                        et_coll = get_mongo_collection('event_types')
-                        et_doc = et_coll.find_one({'key': et_key})
-                        if et_doc:
-                            et_id = str(et_doc.get('_id'))
-                            ev['event_type'] = et_id
-                            if 'points' not in ev or ev.get('points') is None:
-                                ev['points'] = et_doc.get('default_points', 0)
-                    # Compose day key and push
-                    day_key = f"{date}_{classroom_id}"
-                    ev_comp = {
-                        'event_type': et_id,
-                        'event_type_key': et_key,
-                        'student': ev.get('student_id') or ev.get('student'),
-                        'student_id': ev.get('student_id') or ev.get('student'),  # Ensure student_id is present
-                        'points': ev.get('points', 0),
-                        'description': ev.get('description', ''),
+                
+                # Đảm bảo day_key được tạo ngay cả khi events rỗng (để xử lý xóa period)
+                day_key = f"{date}_{classroom_id}"
+                if day_key not in events_by_date_class:
+                    events_by_date_class[day_key] = {
                         'date': date,
-                        'classroom': classroom_id,
-                        'session': ev.get('session'),  # Support session field for attendance (morning/afternoon)
+                        'classroom_id': classroom_id,
+                        'periods': {}
                     }
-                    push_event(day_key, period_key, ev_comp)
+                
+                # Nếu events rỗng, vẫn cần ghi nhận period này để xóa nó sau
+                if len(events) == 0:
+                    events_by_date_class[day_key]['periods'][period_key] = []
+                else:
+                    # Xử lý từng event
+                    for ev in events:
+                        # Map key->id if needed
+                        et_id = ev.get('event_type')
+                        et_key = ev.get('event_type_key')
+                        if not et_id and et_key:
+                            et_coll = get_mongo_collection('event_types')
+                            et_doc = et_coll.find_one({'key': et_key})
+                            if et_doc:
+                                et_id = str(et_doc.get('_id'))
+                                ev['event_type'] = et_id
+                                if 'points' not in ev or ev.get('points') is None:
+                                    ev['points'] = et_doc.get('default_points', 0)
+                        # Compose day key and push
+                        ev_comp = {
+                            'event_type': et_id,
+                            'event_type_key': et_key,
+                            'student': ev.get('student_id') or ev.get('student'),
+                            'student_id': ev.get('student_id') or ev.get('student'),  # Ensure student_id is present
+                            'points': ev.get('points', 0),
+                            'description': ev.get('description', ''),
+                            'date': date,
+                            'classroom': classroom_id,
+                            'session': ev.get('session'),  # Support session field for attendance (morning/afternoon)
+                        }
+                        push_event(day_key, period_key, ev_comp)
         else:
             # CASE B: legacy flat events array
             for event_data in events_data:
@@ -573,13 +587,18 @@ def mongo_events_optimized_create(request):
                 # Merge từng period mới vào periods hiện có
                 for period_key, new_events in day_data['periods'].items():
                     if period_key not in merged_periods:
-                        # Period mới, thêm trực tiếp
-                        merged_periods[period_key] = new_events
+                        # Period mới, thêm trực tiếp (chỉ nếu có events)
+                        if new_events:
+                            merged_periods[period_key] = new_events
                     else:
                         # Period đã tồn tại
                         if period_key == 'attendance':
                             # Với attendance, replace toàn bộ để đảm bảo xóa được events đã bị xóa ở frontend
-                            merged_periods[period_key] = new_events
+                            if new_events:
+                                merged_periods[period_key] = new_events
+                            else:
+                                # Nếu mảng rỗng, xóa period này
+                                merged_periods.pop(period_key, None)
                         else:
                             # Với các period khác, merge events
                             existing_events = merged_periods[period_key]
