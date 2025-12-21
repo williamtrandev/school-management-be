@@ -163,6 +163,8 @@ def mongo_events_optimized_list(request):
         
         classroom_id = request.query_params.get('classroom_id')
         date = request.query_params.get('date')
+        include_sudden = request.query_params.get('include_sudden', 'false').lower() == 'true'
+        include_bonus = request.query_params.get('include_bonus', 'false').lower() == 'true'
         
         # Pagination parameters
         page = int(request.query_params.get('page', 1))
@@ -258,10 +260,19 @@ def mongo_events_optimized_list(request):
             t['created_at'] = t.get('created_at') or ''
             t['updated_at'] = t.get('updated_at') or t['created_at']
             
-            # Loại bỏ period "attendance" và "sudden" (violation) khỏi hoạt động trong ngày
+            # Loại bỏ period "attendance", "violation_sudden", "bonus_sudden" khỏi hoạt động trong ngày
+            # Trừ khi include_sudden=True (để hiển thị trang vi phạm đột xuất) hoặc include_bonus=True (để hiển thị trang điểm cộng)
             periods = t.get('periods', {})
             if isinstance(periods, dict):
-                filtered_periods = {k: v for k, v in periods.items() if k not in ['attendance', 'sudden']}
+                if include_sudden:
+                    # Chỉ hiển thị periods["violation_sudden"], loại bỏ các periods khác
+                    filtered_periods = {k: v for k, v in periods.items() if k == 'violation_sudden'}
+                elif include_bonus:
+                    # Chỉ hiển thị periods["bonus_sudden"], loại bỏ các periods khác
+                    filtered_periods = {k: v for k, v in periods.items() if k == 'bonus_sudden'}
+                else:
+                    # Loại bỏ period "attendance", "violation_sudden", "bonus_sudden" (và "sudden" cho backward compatibility) khỏi hoạt động trong ngày
+                    filtered_periods = {k: v for k, v in periods.items() if k not in ['attendance', 'violation_sudden', 'bonus_sudden', 'sudden']}
                 
                 # Chỉ thêm document vào kết quả nếu còn periods sau khi filter
                 if filtered_periods:
@@ -392,8 +403,13 @@ def mongo_events_optimized_detail(request):
                     event['student_name'] = student_map[event['student_id']]
                 
                 # Add event_type_name
-                if event.get('event_type_key') and event['event_type_key'] in type_map:
-                    event['event_type_name'] = type_map[event['event_type_key']]
+                event_type_key = event.get('event_type_key')
+                if event_type_key:
+                    if event_type_key in type_map:
+                        event['event_type_name'] = type_map[event_type_key]
+                    elif event_type_key == 'custom_bonus_point':
+                        # Điểm cộng đột xuất: sử dụng description làm tên nếu không có trong event_types
+                        event['event_type_name'] = event.get('description', 'Điểm cộng đột xuất')
         return ok(t)
     except Exception as exc:
         logging.getLogger(__name__).exception('mongo_events_optimized_detail error')
@@ -414,6 +430,27 @@ def mongo_events_optimized_create(request):
         
         if not events_data and not isinstance(periods_payload, dict):
             return bad_request('Không có sự kiện nào để tạo')
+        
+        # Kiểm tra quyền cho vi phạm đột xuất (period "violation_sudden" hoặc "bonus_sudden")
+        # Chỉ admin và dorm_supervisor mới được tạo/chỉnh sửa vi phạm đột xuất và điểm cộng đột xuất
+        has_sudden_violations = False
+        if isinstance(periods_payload, dict):
+            has_sudden_violations = ('violation_sudden' in periods_payload and periods_payload['violation_sudden']) or \
+                                   ('bonus_sudden' in periods_payload and periods_payload['bonus_sudden']) or \
+                                   ('sudden' in periods_payload and periods_payload['sudden'])  # Backward compatibility
+        elif events_data:
+            # Kiểm tra trong events_data nếu có period là "violation_sudden", "bonus_sudden", "sudden" hoặc null
+            for event_data in events_data:
+                period = event_data.get('period')
+                if period in ['violation_sudden', 'bonus_sudden', 'sudden'] or period is None:
+                    has_sudden_violations = True
+                    break
+        
+        if has_sudden_violations and user.role not in ['admin', 'dorm_supervisor']:
+            return Response(
+                {'error': 'Bạn không có quyền tạo/chỉnh sửa vi phạm đột xuất. Chỉ quản sinh mới có quyền này.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
         
         # Lấy thông tin học sinh (không cần kiểm tra quyền)
         student_classroom_id = None
@@ -489,7 +526,8 @@ def mongo_events_optimized_create(request):
                         # Map key->id if needed
                         et_id = ev.get('event_type')
                         et_key = ev.get('event_type_key')
-                        if not et_id and et_key:
+                        # Xử lý custom_bonus_point: không cần tìm trong event_types collection
+                        if not et_id and et_key and et_key != 'custom_bonus_point':
                             et_coll = get_mongo_collection('event_types')
                             et_doc = et_coll.find_one({'key': et_key})
                             if et_doc:
@@ -499,7 +537,7 @@ def mongo_events_optimized_create(request):
                                     ev['points'] = et_doc.get('default_points', 0)
                         # Compose day key and push
                         ev_comp = {
-                            'event_type': et_id,
+                            'event_type': et_id,  # Có thể là None cho custom_bonus_point
                             'event_type_key': et_key,
                             'student': ev.get('student_id') or ev.get('student'),
                             'student_id': ev.get('student_id') or ev.get('student'),  # Ensure student_id is present
@@ -516,7 +554,8 @@ def mongo_events_optimized_create(request):
                 # Hỗ trợ nhận event_type_key và map sang id nếu thiếu
                 et_id = event_data.get('event_type')
                 et_key = event_data.get('event_type_key')
-                if not et_id and et_key:
+                # Xử lý custom_bonus_point: không cần tìm trong event_types collection
+                if not et_id and et_key and et_key != 'custom_bonus_point':
                     et_coll = get_mongo_collection('event_types')
                     et_doc = et_coll.find_one({'key': et_key})
                     if et_doc:
@@ -553,10 +592,22 @@ def mongo_events_optimized_create(request):
             # Tạo document cho mỗi ngày-lớp
             total_events = sum(len(period_events) for period_events in day_data['periods'].values())
             
-            # Logic duyệt: Học sinh cần duyệt, Giáo viên/Admin tự động duyệt
-            approval_status = 'approved' if user.role in ['teacher', 'admin'] else 'pending'
-            approved_by = str(user.id) if user.role in ['teacher', 'admin'] else None
-            approved_by_name = user.full_name or f"{user.first_name} {user.last_name}".strip() if user.role in ['teacher', 'admin'] else None
+            # Kiểm tra xem có điểm cộng đột xuất hoặc vi phạm đột xuất không
+            has_sudden_events = 'bonus_sudden' in day_data['periods'] or 'violation_sudden' in day_data['periods'] or 'sudden' in day_data['periods']
+            
+            # Logic duyệt:
+            # - Điểm cộng đột xuất và vi phạm đột xuất: luôn tự động duyệt (không cần duyệt)
+            # - Hoạt động trong ngày: Học sinh cần duyệt, Giáo viên/Admin tự động duyệt
+            if has_sudden_events:
+                # Điểm cộng đột xuất và vi phạm đột xuất: tự động duyệt
+                approval_status = 'approved'
+                approved_by = str(user.id)
+                approved_by_name = user.full_name or f"{user.first_name} {user.last_name}".strip()
+            else:
+                # Hoạt động trong ngày: học sinh cần duyệt, giáo viên/admin tự động duyệt
+                approval_status = 'approved' if user.role in ['teacher', 'admin'] else 'pending'
+                approved_by = str(user.id) if user.role in ['teacher', 'admin'] else None
+                approved_by_name = user.full_name or f"{user.first_name} {user.last_name}".strip() if user.role in ['teacher', 'admin'] else None
             
             day_doc = {
                 'date': day_data['date'],
@@ -690,6 +741,24 @@ def mongo_events_optimized_replace(request):
         if not classroom_id or not date:
             return bad_request('Thiếu classroom_id hoặc date')
         
+        # Kiểm tra quyền cho vi phạm đột xuất (period "sudden")
+        # Chỉ admin và dorm_supervisor mới được thay thế vi phạm đột xuất
+        has_sudden_violations = False
+        if isinstance(periods_payload, dict):
+            has_sudden_violations = 'sudden' in periods_payload and periods_payload['sudden']
+        elif events_data:
+            for event_data in events_data:
+                period = event_data.get('period')
+                if period == 'sudden' or period is None:
+                    has_sudden_violations = True
+                    break
+        
+        if has_sudden_violations and user.role not in ['admin', 'dorm_supervisor']:
+            return Response(
+                {'error': 'Bạn không có quyền thay thế vi phạm đột xuất. Chỉ quản sinh mới có quyền này.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
         # Tự động lấy lớp của học sinh nếu là student
         if user.role == 'student':
             students_coll = get_mongo_collection('students')
@@ -719,7 +788,8 @@ def mongo_events_optimized_replace(request):
                 for ev in events:
                     et_id = ev.get('event_type')
                     et_key = ev.get('event_type_key')
-                    if not et_id and et_key:
+                    # Xử lý custom_bonus_point: không cần tìm trong event_types collection
+                    if not et_id and et_key and et_key != 'custom_bonus_point':
                         et_doc = et_coll.find_one({'key': et_key})
                         if et_doc:
                             et_id = str(et_doc.get('_id'))
@@ -739,7 +809,8 @@ def mongo_events_optimized_replace(request):
                     periods[period] = []
                 et_id = event_data.get('event_type')
                 et_key = event_data.get('event_type_key')
-                if not et_id and et_key:
+                # Xử lý custom_bonus_point: không cần tìm trong event_types collection
+                if not et_id and et_key and et_key != 'custom_bonus_point':
                     et_doc = et_coll.find_one({'key': et_key})
                     if et_doc:
                         et_id = str(et_doc.get('_id'))
@@ -815,6 +886,14 @@ def mongo_events_bulk_sync(request):
         
         if not classroom_id or not date or not period:
             return Response({'error': 'Thiếu thông tin bắt buộc'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Kiểm tra quyền cho vi phạm đột xuất (period "sudden")
+        # Chỉ admin và dorm_supervisor mới được đồng bộ vi phạm đột xuất
+        if period == 'sudden' and user.role not in ['admin', 'dorm_supervisor']:
+            return Response(
+                {'error': 'Bạn không có quyền đồng bộ vi phạm đột xuất. Chỉ quản sinh mới có quyền này.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
         
         # Tự động lấy lớp của học sinh nếu là student
         if user.role == 'student':
@@ -892,6 +971,17 @@ def mongo_events_bulk_replace(request):
         if not classroom_id or not date:
             return Response({'error': 'Thiếu thông tin bắt buộc'}, status=status.HTTP_400_BAD_REQUEST)
         
+        # Kiểm tra quyền cho vi phạm đột xuất (period "violation_sudden" hoặc "bonus_sudden")
+        # Chỉ admin và dorm_supervisor mới được ghi đè vi phạm đột xuất và điểm cộng đột xuất
+        has_sudden_violations = ('violation_sudden' in periods_data and periods_data['violation_sudden']) or \
+                               ('bonus_sudden' in periods_data and periods_data['bonus_sudden']) or \
+                               ('sudden' in periods_data and periods_data['sudden'])  # Backward compatibility
+        if has_sudden_violations and user.role not in ['admin', 'dorm_supervisor']:
+            return Response(
+                {'error': 'Bạn không có quyền ghi đè vi phạm đột xuất. Chỉ quản sinh mới có quyền này.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
         # Tự động lấy lớp của học sinh nếu là student
         if user.role == 'student':
             students_coll = get_mongo_collection('students')
@@ -915,24 +1005,68 @@ def mongo_events_bulk_replace(request):
             'classroom_id': classroom_id
         })
         
-        # Tính tổng số events
-        total_events = sum(len(events) for events in periods_data.values())
+        # Tính tổng số events (chỉ tính các period có events, không tính mảng rỗng)
+        total_events = sum(len(events) for events in periods_data.values() if isinstance(events, list) and len(events) > 0)
         
-        # Logic duyệt: Học sinh cần duyệt, Giáo viên/Admin tự động duyệt
-        approval_status = 'approved' if user.role in ['teacher', 'admin'] else 'pending'
-        approved_by = str(user.id) if user.role in ['teacher', 'admin'] else None
-        approved_by_name = user.full_name or f"{user.first_name} {user.last_name}".strip() if user.role in ['teacher', 'admin'] else None
+        # Kiểm tra xem có điểm cộng đột xuất hoặc vi phạm đột xuất không (chỉ tính các period có events)
+        has_sudden_events = any(
+            (key in periods_data and isinstance(periods_data[key], list) and len(periods_data[key]) > 0)
+            for key in ['bonus_sudden', 'violation_sudden', 'sudden']
+        )
+        
+        # Logic duyệt:
+        # - Điểm cộng đột xuất và vi phạm đột xuất: luôn tự động duyệt (không cần duyệt)
+        # - Hoạt động trong ngày: Học sinh cần duyệt, Giáo viên/Admin tự động duyệt
+        if has_sudden_events:
+            # Điểm cộng đột xuất và vi phạm đột xuất: tự động duyệt
+            approval_status = 'approved'
+            approved_by = str(user.id)
+            approved_by_name = user.full_name or f"{user.first_name} {user.last_name}".strip()
+        else:
+            # Hoạt động trong ngày: học sinh cần duyệt, giáo viên/admin tự động duyệt
+            approval_status = 'approved' if user.role in ['teacher', 'admin'] else 'pending'
+            approved_by = str(user.id) if user.role in ['teacher', 'admin'] else None
+            approved_by_name = user.full_name or f"{user.first_name} {user.last_name}".strip() if user.role in ['teacher', 'admin'] else None
         
         if existing_doc:
-            # Ghi đè toàn bộ periods
+            # Ghi đè toàn bộ periods, nhưng loại bỏ các period có mảng rỗng
+            # Lọc ra các period có mảng rỗng để xóa chúng
+            periods_to_set = {}
+            periods_to_unset = []
+            
+            for period_key, period_events in periods_data.items():
+                if isinstance(period_events, list) and len(period_events) == 0:
+                    # Mảng rỗng: xóa period này
+                    periods_to_unset.append(f'periods.{period_key}')
+                else:
+                    # Có dữ liệu: giữ lại
+                    periods_to_set[period_key] = period_events
+            
             update_data = {
-                'periods': periods_data,
                 'total_events': total_events,
                 'updated_at': datetime.now().isoformat(),
             }
             
-            # Cập nhật approval status nếu cần
-            if user.role in ['teacher', 'admin']:
+            # Luôn set periods (có thể là dict rỗng nếu tất cả periods đều bị xóa)
+            # Nếu có periods để set, dùng periods_to_set; nếu không, dùng dict rỗng để xóa tất cả periods
+            if periods_to_set:
+                update_data['periods'] = periods_to_set
+            elif periods_to_unset:
+                # Nếu chỉ có periods để unset và không có periods để set, set periods thành dict rỗng
+                # MongoDB sẽ xóa các field được unset và set periods thành {}
+                update_data['periods'] = {}
+            
+            # Cập nhật approval status
+            if has_sudden_events:
+                # Điểm cộng đột xuất và vi phạm đột xuất: tự động duyệt
+                update_data.update({
+                    'approval_status': 'approved',
+                    'approved_by': str(user.id),
+                    'approved_by_name': user.full_name or f"{user.first_name} {user.last_name}".strip(),
+                    'approved_at': datetime.now().isoformat(),
+                })
+            elif user.role in ['teacher', 'admin']:
+                # Giáo viên/Admin: tự động duyệt
                 update_data.update({
                     'approval_status': 'approved',
                     'approved_by': str(user.id),
@@ -940,7 +1074,7 @@ def mongo_events_bulk_replace(request):
                     'approved_at': datetime.now().isoformat(),
                 })
             elif user.role == 'student':
-                # Học sinh update → cần duyệt lại
+                # Học sinh update hoạt động trong ngày → cần duyệt lại
                 update_data.update({
                     'approval_status': 'pending',
                     'approved_by': None,
@@ -948,9 +1082,16 @@ def mongo_events_bulk_replace(request):
                     'approved_at': None,
                 })
             
+            # Build update operation
+            update_operation = {}
+            if update_data:
+                update_operation['$set'] = update_data
+            if periods_to_unset:
+                update_operation['$unset'] = {period: '' for period in periods_to_unset}
+            
             events_coll.update_one(
                 {'_id': existing_doc['_id']},
-                {'$set': update_data}
+                update_operation
             )
             action = 'updated'
         else:
